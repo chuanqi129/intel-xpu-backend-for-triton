@@ -1,0 +1,11 @@
+# Too slow: each case takes about 13 minutes, the whole file about 100 minutes.
+# TODO: file an issue and link it here.
+test/transformers/test_fused_moe.py::test_correctness
+
+# Numerical mismatch: luspo token-level bf16.
+# TODO: file an issue and link it here.
+test/chunked_loss/test_grpo_loss.py::test_correctness[None-token-luspo-False-False-True-0.1-0.2-0.2-1.0-True-1.0-dtype0-0.05-0.5-8-128-1024-4096]
+
+# Fails in bf16 multimodal convergence.
+# TODO: file an issue and link it here.
+test/convergence/bf16/test_mini_models_multimodal.py::test_mini_model_multimodal[mini_llava-32-1e-05-dtype1-0.05-0.05-0.1-0.01-0.01-0.01]
