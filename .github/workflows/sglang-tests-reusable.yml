@@ -232,6 +232,8 @@ jobs:
         uses: ./.github/actions/setup-pytorch
         with:
           lts: ${{ inputs.runner_label == 'lts' }}
+          # TEMP R1: force the download path
+          cache: disabled
           download_artifact: pytorch-sglang-${{ inputs.python_version }}-${{ inputs.runner_label || 'default' }}
 
       # sglang imports torchvision.io at module level and install-sglang.sh strips

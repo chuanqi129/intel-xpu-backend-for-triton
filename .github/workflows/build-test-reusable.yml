@@ -250,6 +250,8 @@ jobs:
           ref: ${{ inputs.pytorch_ref }}
           mode: ${{ inputs.pytorch_mode }}
           lts: ${{ inputs.runner_label == 'lts' || inputs.driver_version == 'lts' }}
+          # TEMP R1: force the download path
+          cache: disabled
           download_artifact: pytorch-${{ inputs.python_version }}-${{ needs.build.outputs.artifact-label }}${{ inputs.runner_label != '' && inputs.driver_version == 'lts' && '-lts' || '' }}
 
       - name: Download Triton wheels

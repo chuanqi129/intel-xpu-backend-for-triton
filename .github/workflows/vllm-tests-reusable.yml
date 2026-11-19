@@ -192,6 +192,8 @@ jobs:
         uses: ./.github/actions/setup-pytorch
         with:
           lts: ${{ inputs.runner_label == 'lts' }}
+          # TEMP R1: force the download path
+          cache: disabled
           download_artifact: pytorch-vllm-${{ inputs.python_version }}-${{ inputs.runner_label || 'default' }}
 
       - name: Identify torchvision pin
