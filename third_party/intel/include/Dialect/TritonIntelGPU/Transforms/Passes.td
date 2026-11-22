@@ -679,6 +679,7 @@ def TritonIntelGPULowerTo2DBlockLoad
 
   let dependentDialects = [
     "mlir::arith::ArithDialect",
+    "mlir::scf::SCFDialect",
     "mlir::triton::TritonDialect",
     "mlir::triton::gpu::intel::TritonIntelGPUDialect"
   ];

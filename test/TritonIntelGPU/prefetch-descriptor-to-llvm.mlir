@@ -167,3 +167,22 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 16 : i32}
     tt.return
   }
 }
+
+// -----
+
+// COM: The prefetch keeps the whole 4-byte granules of the width (#8814).
+module attributes {"ttg.num-warps" = 8 : i32, "ttg.threads-per-warp" = 16 : i32} {
+// CHECK-LABEL:   llvm.func spir_kernelcc @prefetch_descriptor_unaligned_width(
+  tt.func public @prefetch_descriptor_unaligned_width(%arg0: !tt.ptr<f16>, %arg1: i32, %arg2: i32, %arg5: i64) {
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i64 = arith.constant 1 : i64
+    %desc = tt.make_tensor_descriptor %arg0, [%arg1, %arg2], [%arg5, %c1_i64] : <f16>, <16x32xf16>
+    // CHECK: %[[SHAPE1:.*]] = llvm.extractvalue %{{.*}}[1]
+    // CHECK: %[[GRANULES:.*]] = llvm.and %[[SHAPE1]], %{{.*}} : i64
+    // CHECK: %[[BYTES:.*]] = llvm.mul %[[GRANULES]]
+    // CHECK: %[[WIDTH:.*]] = llvm.trunc %[[BYTES]] : i64 to i32
+    // CHECK: triton_gen.2Dblockprefetch %{{.*}}, %[[WIDTH]],
+    ttig.descriptor_prefetch %desc[%c0_i32, %c0_i32] {ttig.block_io = "row_major", ttig.block_io_unaligned_width} : !tt.tensordesc<16x32xf16>
+    tt.return
+  }
+}

@@ -439,7 +439,8 @@ private:
       }
     }
 
-    if (!satisfies2DBlockReadAlignment(op, axisInfoAnalysis)) {
+    bool unalignedWidth = false;
+    if (!satisfies2DBlockReadAlignment(op, axisInfoAnalysis, unalignedWidth)) {
       LDBG("Alignment checks failed for: " << *op);
       return;
     }
@@ -470,6 +471,10 @@ private:
     // Every candidate was checked to have a unit last stride above.
     op->setAttr(ttgi::TritonIntelGPUDialect::getBlockIOAttrName(),
                 StringAttr::get(context, "row_major"));
+    if (unalignedWidth)
+      op->setAttr(
+          ttgi::TritonIntelGPUDialect::getBlockIOUnalignedWidthAttrName(),
+          UnitAttr::get(context));
   }
 
   template <typename OpType, typename = std::enable_if_t<llvm::is_one_of<
@@ -1306,7 +1311,8 @@ private:
             typename = std::enable_if_t<llvm::is_one_of<
                 OpType, tt::DescriptorLoadOp, tt::DescriptorStoreOp>::value>>
   bool satisfies2DBlockReadAlignment(
-      OpType op, tt::intel::ModuleAxisInfoAnalysis &axisInfoAnalysis) const {
+      OpType op, tt::intel::ModuleAxisInfoAnalysis &axisInfoAnalysis,
+      bool &unalignedWidth) const {
     Value desc = op.getDesc();
 
     // Find all MakeTensorDescOps that could define this descriptor.
@@ -1359,7 +1365,20 @@ private:
         baseWidth.printAsOperand(llvm::dbgs(), {});
         llvm::dbgs() << "\ndivisor: " << divisor << "\n";
       });
-      return false;
+      // A zero-padded rank-2 load can round the width down to a granule if
+      // that keeps the 64-byte minimum (see LowerTo2DBlockLoad, #8814).
+      if constexpr (!std::is_same_v<OpType, tt::DescriptorLoadOp>) {
+        return false;
+      } else {
+        std::optional<int64_t> width =
+            tt::intel::getFoldedConstantValue(baseWidth);
+        if (!width || rank != 2 || op.getType().getRank() != 2 ||
+            elementWidth % 8 ||
+            defs.consistentPadding() != tt::PaddingOption::PAD_ZERO ||
+            llvm::alignDown(*width, divisor) * elementWidth < 64 * 8)
+          return false;
+        unalignedWidth = true;
+      }
     }
     LDBG("baseWidth: " << baseWidth);
 

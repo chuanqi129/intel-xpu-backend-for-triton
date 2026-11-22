@@ -435,3 +435,33 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     tt.return
   }
 }
+
+// -----
+
+// COM: Only a zero-padded load whose constant width keeps 64 bytes when
+// COM: rounded down to a 4-byte granule is tagged (#8814).
+#dpas = #ttig.dpas<{repeatCount = 8, systolicDepth = 8, executionSize = 16, opsPerChan = 2, threadsPerWarp = 16, warpsPerCTA = [4, 2], repCluster = [1, 1], A = [8, 16], B = [16, 16], C = [8, 16]}>
+#dot_a = #ttg.dot_op<{opIdx = 0, parent = #dpas, kWidth = 1}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.threads-per-warp" = 16 : i32, ttig.support_2d_block_io} {
+  // CHECK-LABEL: tt.func public @unaligned_width(
+  tt.func public @unaligned_width(%base: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %pitch: i64 {tt.divisibility = 16 : i32}, %k: i32) {
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i64 = arith.constant 1 : i64
+    %c31_i32 = arith.constant 31 : i32
+    %c33_i32 = arith.constant 33 : i32
+    %c64_i32 = arith.constant 64 : i32
+    // CHECK: tt.descriptor_load {{.*}} {ttig.block_io = "row_major", ttig.block_io_unaligned_width, ttig.desc_padding = 1 : i32}
+    // CHECK: tt.descriptor_store {{.*}} {ttig.desc_padding = 1 : i32}
+    %0 = tt.make_tensor_descriptor %base, [%c64_i32, %c33_i32], [%pitch, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<64x32xf16, #dot_a>
+    %1 = tt.descriptor_load %0[%c0_i32, %c0_i32] : !tt.tensordesc<64x32xf16, #dot_a> -> tensor<64x32xf16, #dot_a>
+    tt.descriptor_store %0[%c0_i32, %c0_i32], %1 : !tt.tensordesc<64x32xf16, #dot_a>, tensor<64x32xf16, #dot_a>
+    // CHECK-COUNT-3: tt.descriptor_load {{.*}} {ttig.desc_padding = {{[12]}} : i32}
+    %2 = tt.make_tensor_descriptor %base, [%c64_i32, %c31_i32], [%pitch, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<64x32xf16, #dot_a>
+    %3 = tt.descriptor_load %2[%c0_i32, %c0_i32] : !tt.tensordesc<64x32xf16, #dot_a> -> tensor<64x32xf16, #dot_a>
+    %4 = tt.make_tensor_descriptor %base, [%c64_i32, %k], [%pitch, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<64x32xf16, #dot_a>
+    %5 = tt.descriptor_load %4[%c0_i32, %c0_i32] : !tt.tensordesc<64x32xf16, #dot_a> -> tensor<64x32xf16, #dot_a>
+    %6 = tt.make_tensor_descriptor %base, [%c64_i32, %c33_i32], [%pitch, %c1_i64] {padding = 2 : i32} : !tt.ptr<f16>, !tt.tensordesc<64x32xf16, #dot_a>
+    %7 = tt.descriptor_load %6[%c0_i32, %c0_i32] : !tt.tensordesc<64x32xf16, #dot_a> -> tensor<64x32xf16, #dot_a>
+    tt.return
+  }
+}

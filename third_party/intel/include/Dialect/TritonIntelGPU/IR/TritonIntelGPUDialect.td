@@ -119,6 +119,12 @@ def TritonIntelGPU_Dialect : Dialect {
       return "ttig.block_io_anchor";
     }
 
+    /// Get the name of the attribute marking a `ttig.block_io` descriptor load
+    /// whose width is not a whole number of 4-byte granules (#8814).
+    static constexpr llvm::StringRef getBlockIOUnalignedWidthAttrName() {
+      return "ttig.block_io_unaligned_width";
+    }
+
     /// Get the name of the attribute marking a `ttig.2d_block_load_from_ptr`
     /// (or prefetch) whose `base_height` is a runtime row-limit bound, not a
     /// fixed per-message tile height (see ttgi::matchRowLimitMask).

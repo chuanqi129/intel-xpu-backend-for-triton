@@ -2319,6 +2319,14 @@ struct DescriptorPrefetchOpConversion
     Value baseWidth = desc.shapes[colIdx];
     Value baseHeight = desc.shapes[rowIdx];
     Value rowStride = desc.strides[rowIdx];
+    // Keep the whole granules only, as the load does (see LowerTo2DBlockLoad).
+    if (op->hasAttr(
+            TritonIntelGPUDialect::getBlockIOUnalignedWidthAttrName())) {
+      unsigned elemBits = eltTy.getIntOrFloatBitWidth();
+      int64_t granule =
+          get2DBlockIOWidthGranuleBytes(elemBits) / (elemBits / 8);
+      baseWidth = b.and_(baseWidth, b.i64_val(-granule));
+    }
 
     // Get offset bases from the indices operand.
     // For tensor descriptors, indices are supplied explicitly via the op

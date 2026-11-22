@@ -1,11 +1,13 @@
 #include "intel/include/Analysis/AxisInfoExt.h"
 #include "intel/include/Analysis/StrideInfo.h"
+#include "intel/include/Analysis/Utility.h"
 #include "intel/include/Dialect/TritonIntelGPU/IR/Dialect.h"
 #include "intel/include/Dialect/TritonIntelGPU/Transforms/BlockIOUtils.h"
 #include "intel/include/Dialect/TritonIntelGPU/Transforms/Passes.h"
 #include "intel/include/Dialect/TritonIntelGPU/Transforms/Utility.h"
 #include "intel/include/Utils/Utility.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Dominance.h"
@@ -82,6 +84,33 @@ static Value createZeroSplat(OpBuilder &builder, Location loc,
   Value zeroVal =
       arith::ConstantOp::create(builder, loc, cast<TypedAttr>(zeroAttr));
   return tt::SplatOp::create(builder, loc, tensorTy, zeroVal);
+}
+
+/// `sliceTy`'s layout with its distinct elements spread over the lanes of each
+/// warp, if converting it back is a sub-group shuffle; null otherwise.
+static Attribute getLaneDistributedEncoding(RankedTensorType sliceTy) {
+  MLIRContext *ctx = sliceTy.getContext();
+  LinearLayout ll = ttg::toLinearLayout(sliceTy);
+  LinearLayout::BasesT bases = ll.getBases();
+  auto &regs = bases[StringAttr::get(ctx, "register")];
+  auto &lanes = bases[StringAttr::get(ctx, "lane")];
+  auto isZero = [](ArrayRef<int32_t> basis) {
+    return llvm::all_of(basis, [](int32_t v) { return v == 0; });
+  };
+  if (regs.size() < lanes.size() || !llvm::all_of(lanes, isZero) ||
+      llvm::any_of(regs, isZero))
+    return {};
+  for (auto [lane, reg] : llvm::zip(lanes, regs))
+    lane = reg;
+  regs.erase(regs.begin(), regs.begin() + lanes.size());
+  std::optional<LinearLayout> distributed = LinearLayout::tryCreate(
+      std::move(bases), ll.getOutDims(), /*requireSurjective=*/true);
+  if (!distributed)
+    return {};
+  Attribute enc = ttg::LinearEncodingAttr::get(ctx, std::move(*distributed));
+  if (!ttgi::cvtIsSubGroupShuffle(sliceTy.cloneWithEncoding(enc), sliceTy))
+    return {};
+  return enc;
 }
 
 struct TritonIntelGPULowerTo2DBlockLoadPass
@@ -178,6 +207,11 @@ private:
         tt::intel::findDescriptorDefinitions(desc);
     std::optional<tt::PaddingOption> padding = defs.consistentPadding();
     assert(padding && "isDescriptorLoadLowerableTo2DBlock checks padding");
+    bool unalignedWidth = op->hasAttr(
+        ttgi::TritonIntelGPUDialect::getBlockIOUnalignedWidthAttrName());
+    assert((!unalignedWidth ||
+            (rank == 2 && *padding == tt::PaddingOption::PAD_ZERO)) &&
+           "MaterializeBlockPointer marks rank-2, zero-padded loads only");
 
     auto descType = cast<tt::TensorDescType>(desc.getType());
     unsigned descRank = descType.getBlockType().getRank();
@@ -256,8 +290,9 @@ private:
     // (In a tensor descriptor, the last stride is always 1.)
     Value elemBytes =
         arith::ConstantIntOp::create(builder, loc, elemSizeInBits / 8, 32);
-    Value baseWidth = arith::MulIOp::create(
-        builder, loc, toI32(shapes[descRank - 1]), elemBytes);
+    Value innerExtent = toI32(shapes[descRank - 1]);
+    Value baseWidth =
+        arith::MulIOp::create(builder, loc, innerExtent, elemBytes);
     Value baseHeight = toI32(shapes[descRank - 2]);
     Value basePitch = arith::MulIOp::create(
         builder, loc, toI32(strides[descRank - 2]), elemBytes);
@@ -288,6 +323,18 @@ private:
     bool padNan = *padding == tt::PaddingOption::PAD_NAN;
     UnitAttr padNanAttr = padNan ? builder.getUnitAttr() : UnitAttr();
 
+    // The 2D block message cannot end inside a 4-byte granule: keep the whole
+    // granules and reload the columns past them (#8814).
+    int64_t granule =
+        ttgi::get2DBlockIOWidthGranuleBytes(elemSizeInBits) / elemBytesConst;
+    Value granules;
+    if (unalignedWidth) {
+      granules = arith::AndIOp::create(
+          builder, loc, innerExtent,
+          arith::ConstantIntOp::create(builder, loc, -granule, 32));
+      baseWidth = arith::MulIOp::create(builder, loc, granules, elemBytes);
+    }
+
     auto blockLoadOp = ttgi::Subgroup2DBlockLoadOp::create(
         builder, loc, op.getType(), basePtr, baseWidth, baseHeight, basePitch,
         offsetX, offsetY, batchStrides, batchOffsets, batchShapes, padNanAttr,
@@ -299,10 +346,130 @@ private:
           ttgi::TritonIntelGPUDialect::getOneMatrixPerLoadAttrName(),
           builder.getUnitAttr());
 
-    op.replaceAllUsesWith(blockLoadOp.getResult());
+    Value result = blockLoadOp.getResult();
+    if (unalignedWidth)
+      result = patchDroppedColumns(
+          builder, loc, op, result, basePtr, strides[descRank - 2], innerExtent,
+          granules, granule, baseHeight, offsetX, offsetY, memoryRowMajor);
+    op.replaceAllUsesWith(result);
     op.erase();
     LDBG("Converted descriptor load to ttig.2d_block_load: " << *blockLoadOp);
     return true;
+  }
+
+  /// Select the columns [granules, width) into `tile`, loaded where the tile
+  /// reaches them. Only the loads are under the branch: a branch yielding the
+  /// tile makes IGC copy it every iteration. Rows are loaded spread over the
+  /// lanes and shuffled, as one address per row and lane would spill.
+  Value patchDroppedColumns(OpBuilder &builder, Location loc,
+                            tt::DescriptorLoadOp op, Value tile, Value base,
+                            Value pitch, Value width, Value granules,
+                            int64_t granule, Value height, Value x, Value y,
+                            bool memoryRowMajor) {
+    auto tileTy = cast<RankedTensorType>(tile.getType());
+    auto encoding = cast<ttg::DistributedEncodingTrait>(tileTy.getEncoding());
+    Type elemTy = tileTy.getElementType();
+    unsigned colDim = memoryRowMajor ? 1 : 0, rowDim = 1 - colDim;
+    Type i32Ty = builder.getI32Type(), i64Ty = builder.getI64Type();
+    auto cst = [&](int64_t v) -> Value {
+      return arith::ConstantIntOp::create(builder, loc, v, 32);
+    };
+    auto cmp = [&](arith::CmpIPredicate pred, Value lhs, Value rhs) -> Value {
+      return arith::CmpIOp::create(builder, loc, pred, lhs, rhs);
+    };
+    auto andI = [&](Value lhs, Value rhs) -> Value {
+      return arith::AndIOp::create(builder, loc, lhs, rhs);
+    };
+    auto splat = [&](Type ty, Value v) -> Value {
+      return tt::SplatOp::create(builder, loc, ty, v);
+    };
+    auto range = [&](RankedTensorType ty, Value start) -> Value {
+      return arith::AddIOp::create(
+          builder, loc, splat(ty, start),
+          tt::MakeRangeOp::create(builder, loc, ty, 0, ty.getShape()[0]));
+    };
+    // The i32 index type along `dim`, expanding back to `encoding`.
+    auto sliceType = [&](unsigned dim) {
+      return RankedTensorType::get(
+          {tileTy.getShape()[dim]}, i32Ty,
+          ttg::SliceEncodingAttr::get(builder.getContext(), 1 - dim, encoding));
+    };
+    auto column = [&](int64_t k) -> Value {
+      return arith::AddIOp::create(builder, loc, granules, cst(k));
+    };
+
+    // x < width && x + numCols > granules.
+    Value reaches =
+        andI(cmp(arith::CmpIPredicate::slt, x, width),
+             cmp(arith::CmpIPredicate::sgt, x,
+                 arith::SubIOp::create(builder, loc, granules,
+                                       cst(tileTy.getShape()[colDim]))));
+    RankedTensorType colTy = sliceType(rowDim).clone(elemTy);
+    auto ifOp = scf::IfOp::create(
+        builder, loc, SmallVector<Type>(granule - 1, colTy), reaches,
+        /*addThenBlock=*/true, /*addElseBlock=*/true);
+    {
+      OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(ifOp.elseBlock());
+      scf::YieldOp::create(
+          builder, loc,
+          SmallVector<Value>(granule - 1,
+                             createZeroSplat(builder, loc, colTy)));
+
+      builder.setInsertionPointToStart(ifOp.thenBlock());
+      Attribute loadEnc = getLaneDistributedEncoding(colTy);
+      RankedTensorType rowsTy =
+          (loadEnc ? colTy.cloneWithEncoding(loadEnc) : colTy).clone(i32Ty);
+      Value rows = range(rowsTy, y);
+      Value rowInBounds =
+          andI(cmp(arith::CmpIPredicate::sge, rows, splat(rowsTy, cst(0))),
+               cmp(arith::CmpIPredicate::slt, rows, splat(rowsTy, height)));
+      Value rowOffsets = arith::MulIOp::create(
+          builder, loc,
+          arith::ExtSIOp::create(builder, loc, rowsTy.clone(i64Ty), rows),
+          splat(rowsTy.clone(i64Ty), pitch));
+      // The block type may be signed (si8), the tile is not.
+      auto basePtrTy = cast<tt::PointerType>(base.getType());
+      Type ptrTy = tt::PointerType::get(elemTy, basePtrTy.getAddressSpace());
+      if (ptrTy != basePtrTy)
+        base = tt::BitcastOp::create(builder, loc, ptrTy, base);
+      SmallVector<Value> cols;
+      for (int64_t k = 0; k + 1 < granule; ++k) {
+        Value col = column(k);
+        Value colBase = tt::AddPtrOp::create(
+            builder, loc, ptrTy, base,
+            arith::ExtSIOp::create(builder, loc, i64Ty, col));
+        Value ptrs = tt::AddPtrOp::create(builder, loc, rowsTy.clone(ptrTy),
+                                          splat(rowsTy.clone(ptrTy), colBase),
+                                          rowOffsets);
+        Value mask = andI(rowInBounds,
+                          splat(rowsTy.clone(builder.getI1Type()),
+                                cmp(arith::CmpIPredicate::slt, col, width)));
+        Value vals = tt::LoadOp::create(
+            builder, loc, ptrs, mask,
+            createZeroSplat(builder, loc, rowsTy.clone(elemTy)),
+            op.getCachePolicyAttr());
+        if (loadEnc)
+          vals = ttg::ConvertLayoutOp::create(builder, loc, colTy, vals);
+        cols.push_back(vals);
+      }
+      scf::YieldOp::create(builder, loc, cols);
+    }
+
+    // Unconditional: a tile holding a dropped column reaches it.
+    Value tileCols = tt::BroadcastOp::create(
+        builder, loc, tileTy.clone(i32Ty),
+        tt::ExpandDimsOp::create(builder, loc, range(sliceType(colDim), x),
+                                 rowDim));
+    for (int64_t k = 0; k + 1 < granule; ++k) {
+      Value isCol = cmp(arith::CmpIPredicate::eq, tileCols,
+                        splat(tileCols.getType(), column(k)));
+      Value vals = tt::BroadcastOp::create(
+          builder, loc, tileTy,
+          tt::ExpandDimsOp::create(builder, loc, ifOp.getResult(k), colDim));
+      tile = arith::SelectOp::create(builder, loc, isCol, vals, tile);
+    }
+    return tile;
   }
 
   /// Lower a tt.descriptor_load that cannot use a 2D block load to a masked
